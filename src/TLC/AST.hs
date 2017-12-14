@@ -53,6 +53,7 @@ data Type where
   (:->) :: Type -> Type -> Type
   BoolT :: Type
   IntT  :: Type
+  TupleT :: Ctx Type -> Type
 
 infixr 5 :->
 
@@ -60,10 +61,18 @@ infixr 5 :->
 --   data kind 'Type' it allows us to do runtime tests and computation
 --   on 'Type'.  The shape of the data constructors exactly mirror
 --   the shape of the data kind 'Type'.
+  
+-- TypeRepr's are ubiquotous in type-level programming with
+-- GADTs. This is a singleton type -- every type has exactly one
+-- value. Having at most one value of every type for
+-- TypeRepr's/witnesses is important for convincing the Haskell type
+-- system. This is because Haskell is not fully dependently
+-- typed. TypeRepr is a singleton family of indexed types.
 data TypeRepr :: Type -> * where
   ArrowRepr :: TypeRepr τ₁ -> TypeRepr τ₂ -> TypeRepr (τ₁ :-> τ₂)
   BoolRepr  :: TypeRepr BoolT
   IntRepr   :: TypeRepr IntT
+  TupleRepr :: Assignment TypeRepr ctx -> TypeRepr (TupleT ctx)
 
 instance Show (TypeRepr τ) where
   showsPrec _ IntRepr  = showString "IntT"
@@ -71,6 +80,12 @@ instance Show (TypeRepr τ) where
   showsPrec d (ArrowRepr x y) =
      showParen (d > 5) $
        showsPrec 6 x . showString " :-> " . showsPrec 5 y
+  showsPrec d (TupleRepr a) =
+    let printer :: (ShowS, Bool) -> TypeRepr t -> (ShowS, Bool)
+        printer (cnt, first_) rep = ((if not first_ then showString ", " else id) .
+                                     (showsPrec 5 rep) . cnt
+                                    , False)
+    in showParen True $ fst $ foldlFC' printer (id, True) a
 
 instance ShowF TypeRepr
 
@@ -80,13 +95,22 @@ instance (KnownRepr TypeRepr τ₁, KnownRepr TypeRepr τ₂) => KnownRepr TypeR
   knownRepr = ArrowRepr knownRepr knownRepr
 
 instance TestEquality TypeRepr where
+  -- the reason this works is the universe of types a :~: b that can
+  -- be declared is a superset of the values of the types that can
+  -- actually be constructed
   testEquality BoolRepr BoolRepr = return Refl
   testEquality IntRepr  IntRepr  = return Refl
   testEquality (ArrowRepr x₁ x₂) (ArrowRepr y₁ y₂) =
     do Refl <- testEquality x₁ y₁
        Refl <- testEquality x₂ y₂
        return Refl
+  testEquality (TupleRepr a) (TupleRepr b) = do Refl <- testEquality a b
+                                                return Refl
   testEquality _ _ = Nothing
+
+data List :: * -> * where
+  Nil  :: List a
+  Cons :: a -> List a -> List a
 
 -- | This is the main term representation for our STLC.  It is explicitly
 --   a representation of "open" terms.  The 'Term' type has two parameters.
@@ -104,6 +128,7 @@ data Term (γ :: Ctx Type) (τ :: Type) :: * where
   TmApp  :: Term γ (τ₁ :-> τ₂) -> Term γ τ₁ -> Term γ τ₂
   TmAbs  :: String -> TypeRepr τ₁ -> Term (γ ::> τ₁) τ₂ -> Term γ (τ₁ :-> τ₂)
   TmFix  :: String -> TypeRepr τ  -> Term (γ ::> τ)  τ  -> Term γ τ
+  TmTuple :: Assignment (Term γ) ctx -> Term γ (TupleT ctx)
 
 infixl 5 :@
 
@@ -137,7 +162,7 @@ pattern (:<=) :: Term γ IntT -> Term γ IntT -> Term γ BoolT
 pattern x :<= y = TmLe x y
 
 -- | A simple pretty printer for terms.
-printTerm :: Assignment (Const (Int -> ShowS)) γ
+printTerm :: forall γ τ. Assignment (Const (Int -> ShowS)) γ
           -> Int
           -> Term γ τ
           -> ShowS
@@ -168,7 +193,13 @@ printTerm pvar prec tm = case tm of
       showString "λ " . vnm 0 .
       showString " : " . showsPrec 0 tp .
       showString ". " . printTerm (pvar :> Const vnm) 0 x
-
+  TmTuple a -> 
+    let printer :: (ShowS, Bool) -> Term γ τ₁ -> (ShowS, Bool)
+        printer (cnt, first_) tm = ((if not first_ then showString ", " else id) .
+                                     (printTerm pvar 0 tm) . cnt
+                                   ,False)
+    in showParen True $ fst $ foldlFC' printer (id, True) a
+    
 instance KnownContext γ => Show (Term γ τ) where
   showsPrec = printTerm (generate knownSize (\i -> Const (\_ -> shows (indexVal i))))
 
@@ -193,6 +224,7 @@ computeType env tm = case tm of
   TmAbs _ τ₁ x ->
     let τ₂ = computeType (env :> τ₁) x in ArrowRepr τ₁ τ₂
   TmFix _ τ _ -> τ
+  TmTuple a -> TupleRepr $ fmapFC (computeType env) a 
 
 -- | A generic representation of values.  A value for this calculus
 --   is either a basic value of one of the base types (Int or Bool)
@@ -206,12 +238,20 @@ data Value (f :: Type -> *) (τ :: Type) :: * where
   VInt   :: Int -> Value f IntT
   VBool  :: Bool -> Value f BoolT
   VAbs   :: Assignment f γ -> TypeRepr τ₁ -> Term (γ ::> τ₁) τ₂ -> Value f (τ₁ :-> τ₂)
+         -- ^ "assignment of f to γ"
+  VTuple :: Assignment (Value f) ctx -> Value f (TupleT ctx)
 
 instance ShowFC Value where
   showsPrecFC _sh _prec (VInt n) = shows n
   showsPrecFC _sh _prec (VBool b) = shows b
   showsPrecFC sh prec (VAbs env τ tm) =
      printTerm (fmapFC (\x -> Const (\p -> sh p x)) env) prec (TmAbs [] τ tm)
+  showsPrecFC sh prec (VTuple elems) =
+     showParen True $ fst $ foldlFC'
+      (\(cnt, first_) rep -> ((if not first_ then showString ", " else id) .
+                               (showsPrecFC sh 5 rep) . cnt
+                             , False)) (id, True) elems
+
 instance ShowF f => ShowF (Value f)
 instance ShowF f => Show (Value f τ) where
   show = showFC showF

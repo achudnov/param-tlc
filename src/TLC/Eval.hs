@@ -80,6 +80,7 @@ subst sz sub tm = case tm of
   TmApp x y   -> TmApp (subst sz sub x) (subst sz sub y)
   TmAbs nm τ x -> TmAbs nm τ (subst (incSize sz) (extend_sub sz sub) x)
   TmFix nm τ x -> TmFix nm τ (subst (incSize sz) (extend_sub sz sub) x)
+  TmTuple a -> TmTuple $ fmapFC (subst sz sub) a
 
 -- | Substitute a term for a single open variable, leaving all other
 --   variables unchanged.
@@ -121,6 +122,7 @@ substEval sz tm = case tm of
        x' -> TmApp x' y
   TmFix _ _ x ->
      substEval sz (singleSubst sz tm x)
+  TmTuple a -> TmTuple $ fmapFC (substEval sz) a
 
 -------------------------------------------------
 -- Call by value evaluation
@@ -138,11 +140,11 @@ instance Show (CBV τ) where
 --   values to the free variables in @γ@, evaluate the
 --   given term to a @Value@.
 cbvEval ::
-   Assignment CBV γ ->
+   Assignment CBV γ -> -- Assignment is a type of kind Ctx
    Term γ τ ->
    Value CBV τ
 cbvEval env tm = case tm of
-   TmVar i  -> unCBV (env!i)
+   TmVar i  -> unCBV (env!i) -- (!) is total
    TmWeak x -> cbvEval (Ctx.init env) x
    TmBool b -> VBool b
    TmInt n  -> VInt n
@@ -171,6 +173,7 @@ cbvEval env tm = case tm of
          seq y' (cbvEval (env' :> y') body)
    TmFix _ _ x ->
      fix $ \x' -> cbvEval (env :> CBV x') x
+   TmTuple a -> VTuple $ fmapFC (cbvEval env) a
 
 -------------------------------------------------
 -- Call by need evaluation
@@ -240,3 +243,4 @@ cbnEval env tm = case tm of
      mfix $ \result ->
        do resultThunk <- delay (return result)
           cbnEval (env :> resultThunk) x
+   TmTuple a -> VTuple <$> traverseFC (cbnEval env) a

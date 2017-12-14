@@ -41,7 +41,7 @@ import Control.Monad.Except
 import Data.List
 import Data.Type.Equality
 
-import Data.Parameterized.Context
+import Data.Parameterized.Context hiding ((!!))
 import Data.Parameterized.Some
 
 import qualified TLC.AST as AST
@@ -62,12 +62,14 @@ data Term where
   TmApp  :: Term -> Term -> Term
   TmAbs  :: String -> Type -> Term -> Term
   TmFix  :: String -> Type -> Term -> Term
+  TmTuple :: [Term] -> Term
  deriving (Show, Read, Eq, Ord)
 
 data Type where
   IntT :: Type
   BoolT :: Type
   ArrowT :: Type -> Type -> Type
+  TupleT :: [Type] -> Type
  deriving (Show, Read, Eq, Ord)
 
 typeToRepr ::
@@ -78,6 +80,15 @@ typeToRepr BoolT = Some AST.BoolRepr
 typeToRepr (ArrowT x y) =
   case (typeToRepr x, typeToRepr y) of
     (Some x', Some y') -> Some (AST.ArrowRepr x' y')
+typeToRepr (TupleT tys) =
+  let go :: Some (Assignment AST.TypeRepr) -> [Type] -> Some (Assignment AST.TypeRepr)
+      go asgn [] = asgn
+      go asgn (ty:tys) = case typeToRepr ty of
+                           Some tyr ->
+                             case asgn of
+                               Some a -> go (Some $ extend a tyr) tys
+  in case go (Some empty) tys of 
+       Some asgn -> Some $ AST.TupleRepr asgn
 
 -- | The result of a typechecking operation in the context
 --   of free variable context @γ@ is a type repr and
@@ -100,7 +111,7 @@ data TCResult (γ :: Ctx AST.Type) where
 --   production code, as the generated messages are not very user-friendly,
 --   but is convenient and fairly readable for demonstration purposes here.
 
-verifyTyping ::
+verifyTyping :: forall γ.
    [String] {-^ Scope information about the free variable names in stack order (nearest enclosing binder nearset to the front of the list -} ->
    Assignment AST.TypeRepr γ {-^ Typed scope information corresponding to the above -} ->
    Term {-^ A term to check -} ->
@@ -149,13 +160,24 @@ verifyTyping scope env tm = case tm of
         TCResult xtp x' <- verifyTyping (nm:scope) (env :> argTy) x
         Just Refl <- return $ testEquality argTy xtp
         return $ TCResult xtp (AST.TmFix nm argTy x')
-
+   TmTuple terms ->
+     let go :: TCResult γ
+            -> [Term]
+            -> Except String (TCResult γ)
+         go x [] = return x
+         go (TCResult (AST.TupleRepr tyasgn) (AST.TmTuple termasgn)) (tm:tms) =
+           do TCResult tmty tm' <- verifyTyping scope env tm
+              go (TCResult (AST.TupleRepr $ extend tyasgn tmty)
+                           (AST.TmTuple $ extend termasgn tm')) tms
+         go _ _ = fail "Wrong type when constructing a typed tuple term -- this should not have happened"
+     in do go (TCResult (AST.TupleRepr empty) (AST.TmTuple empty)) terms
  where
    fail msg = throwError $ unlines
                [ "Error during typechecking"
                , show tm
                , msg
                ]
+
 
 -- | Typecheck a term in the empty typing context.
 checkTerm ::
